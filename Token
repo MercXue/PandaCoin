@@ -1,0 +1,239 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer, Burn};
+
+declare_id!("PandaPreSale1111111111111111111111111111111111");
+
+#[program]
+pub mod pandacoin_presale {
+    use super::*;
+
+    /// Initializes the presale configuration.
+    /// This sets up the tranches, the charity wallet, sale wallet, and presale vault.
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        charity_wallet: Pubkey,
+        sale_wallet: Pubkey,
+        base_price: u64,    // base price in lamports per token for tranche 1 (e.g., 3_000_000 lamports = 0.003 SOL)
+        multiplier: u64,    // multiplier in basis points (e.g., 11000 for 1.1x, since 10_000 represents 1.0)
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        config.charity_wallet = charity_wallet;
+        config.sale_wallet = sale_wallet;
+        config.current_tranche = 0;
+        config.total_funds_raised = 0;
+        config.total_tokens_sold = 0;
+
+        // Initialize tranche data based on our preset allocation and geometric pricing.
+        // The allocations (in number of tokens) are in billions.
+        // For clarity, we assume tokens are represented in raw units (i.e. 100_000_000_000 = 100B).
+        // Here we set the 10 tranches:
+        config.tranches = [
+            Tranche { token_allocation: 500_000_000, tokens_sold: 0, price: base_price }, // 0.5B
+            Tranche { token_allocation: 1_000_000_000, tokens_sold: 0, price: 0 }, // 1B, price to be computed below
+            Tranche { token_allocation: 1_500_000_000, tokens_sold: 0, price: 0 }, // 1.5B
+            Tranche { token_allocation: 3_000_000_000, tokens_sold: 0, price: 0 }, // 3B
+            Tranche { token_allocation: 3_000_000_000, tokens_sold: 0, price: 0 },
+            Tranche { token_allocation: 3_000_000_000, tokens_sold: 0, price: 0 },
+            Tranche { token_allocation: 3_000_000_000, tokens_sold: 0, price: 0 },
+            Tranche { token_allocation: 2_500_000_000, tokens_sold: 0, price: 0 },
+            Tranche { token_allocation: 1_500_000_000, tokens_sold: 0, price: 0 },
+            Tranche { token_allocation: 1_000_000_000, tokens_sold: 0, price: 0 },
+        ];
+
+        // Set geometric progression for tranche pricing.
+        // The price for tranche i is: price_i = base_price * (multiplier/10000)^i
+        // For simplicity, we compute each price iteratively.
+        let mut current_price = base_price;
+        for i in 0..10 {
+            // For tranche 0 (first tranche) we already set the price.
+            if i > 0 {
+                // Multiply previous price by multiplier (represented in basis points)
+                // Dividing by 10,000 to get the correct factor.
+                current_price = (current_price * multiplier) / 10_000;
+            }
+            config.tranches[i].price = current_price;
+        }
+
+        Ok(())
+    }
+
+    /// Allows a buyer to purchase tokens by sending SOL.
+    /// The function processes the purchase across the current tranche(s),
+    /// applies a 10% fund allocation to charity, and burns 1% of tokens.
+    pub fn buy_tokens(ctx: Context<BuyTokens>, amount: u64) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        let buyer = &mut ctx.accounts.buyer;
+        let presale_vault = &mut ctx.accounts.presale_vault;
+        let token_mint = &ctx.accounts.token_mint;
+        let token_program = &ctx.accounts.token_program;
+
+        // The buyer sends 'amount' lamports. We add it to total funds raised.
+        config.total_funds_raised = config.total_funds_raised.checked_add(amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let mut remaining_amount = amount;
+        let mut total_tokens_to_purchase: u64 = 0;
+
+        // Process purchase across tranches.
+        while remaining_amount > 0 && (config.current_tranche as usize) < config.tranches.len() {
+            let tranche = &mut config.tranches[config.current_tranche as usize];
+            let tranche_remaining = tranche.token_allocation.checked_sub(tranche.tokens_sold)
+                .ok_or(ErrorCode::MathOverflow)?;
+            if tranche_remaining == 0 {
+                config.current_tranche += 1;
+                continue;
+            }
+            let price = tranche.price; // price in lamports per token
+            // How many tokens can be bought in this tranche with the remaining funds?
+            let tokens_affordable = remaining_amount.checked_div(price)
+                .ok_or(ErrorCode::MathOverflow)?;
+            let tokens_in_tranche = std::cmp::min(tranche_remaining, tokens_affordable);
+            if tokens_in_tranche == 0 {
+                break; // Not enough funds to buy even 1 token at this tranche's price.
+            }
+            let cost = tokens_in_tranche.checked_mul(price)
+                .ok_or(ErrorCode::MathOverflow)?;
+            tranche.tokens_sold = tranche.tokens_sold.checked_add(tokens_in_tranche)
+                .ok_or(ErrorCode::MathOverflow)?;
+            total_tokens_to_purchase = total_tokens_to_purchase.checked_add(tokens_in_tranche)
+                .ok_or(ErrorCode::MathOverflow)?;
+            remaining_amount = remaining_amount.checked_sub(cost)
+                .ok_or(ErrorCode::MathOverflow)?;
+
+            // If current tranche is exhausted, move to the next one.
+            if tranche.tokens_sold >= tranche.token_allocation {
+                config.current_tranche += 1;
+            }
+        }
+
+        // Determine the actual lamports spent (which may be less than the sent amount).
+        let sale_cost = amount.checked_sub(remaining_amount).ok_or(ErrorCode::MathOverflow)?;
+        // Calculate charity portion (10%) and sale proceeds (90%).
+        let charity_amount = sale_cost.checked_div(10).ok_or(ErrorCode::MathOverflow)?;
+        let sale_amount = sale_cost.checked_sub(charity_amount).ok_or(ErrorCode::MathOverflow)?;
+
+        // Calculate burn: 1% of tokens purchased.
+        let tokens_to_burn = total_tokens_to_purchase.checked_div(100).ok_or(ErrorCode::MathOverflow)?;
+        // Tokens that the buyer actually receives.
+        let tokens_to_transfer = total_tokens_to_purchase.checked_sub(tokens_to_burn)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        // --- Transfer Funds ---
+        // Transfer charity_amount to the charity wallet.
+        **ctx.accounts.buyer.to_account_info().try_borrow_mut_lamports()? -= charity_amount;
+        **ctx.accounts.charity_wallet.to_account_info().try_borrow_mut_lamports()? += charity_amount;
+
+        // Transfer sale_amount to the sale wallet.
+        **ctx.accounts.buyer.to_account_info().try_borrow_mut_lamports()? -= sale_amount;
+        **ctx.accounts.sale_wallet.to_account_info().try_borrow_mut_lamports()? += sale_amount;
+
+        // (Any leftover lamports remain in the buyer's account; in production you may refund remaining_amount.)
+
+        // --- Token Transfers ---
+        // Transfer tokens from the presale vault to the buyer's token account.
+        // (Assuming the presale vault holds the initial 20B tokens.)
+        let cpi_accounts = Transfer {
+            from: presale_vault.to_account_info(),
+            to: ctx.accounts.buyer_token_account.to_account_info(),
+            authority: ctx.accounts.presale_authority.to_account_info(),
+        };
+        let cpi_program = token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        token::transfer(cpi_ctx, tokens_to_transfer)?;
+
+        // Burn 1% of tokens from the presale vault.
+        let burn_cpi_accounts = Burn {
+            mint: token_mint.to_account_info(),
+            from: presale_vault.to_account_info(),
+            authority: ctx.accounts.presale_authority.to_account_info(),
+        };
+        let burn_cpi_ctx = CpiContext::new(token_program.to_account_info(), burn_cpi_accounts);
+        token::burn(burn_cpi_ctx, tokens_to_burn)?;
+
+        // Update total tokens sold.
+        config.total_tokens_sold = config.total_tokens_sold.checked_add(total_tokens_to_purchase)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        Ok(())
+    }
+}
+
+/// Accounts used for initializing the presale.
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(init, payer = initializer, space = 8 + PresaleConfig::SIZE)]
+    pub config: Account<'info, PresaleConfig>,
+    /// CHECK: This is only used as a recipient for charity funds.
+    #[account(mut)]
+    pub charity_wallet: UncheckedAccount<'info>,
+    /// CHECK: This is the wallet that will receive the sale proceeds.
+    #[account(mut)]
+    pub sale_wallet: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub initializer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Accounts used for purchasing tokens.
+#[derive(Accounts)]
+pub struct BuyTokens<'info> {
+    #[account(mut)]
+    pub config: Account<'info, PresaleConfig>,
+    /// The buyer paying lamports.
+    #[account(mut, signer)]
+    pub buyer: AccountInfo<'info>,
+    /// The presale vault holding the 20B $PANDA tokens.
+    #[account(mut)]
+    pub presale_vault: Account<'info, TokenAccount>,
+    /// The authority allowed to manage the presale vault.
+    /// This account must sign CPI calls for token transfers and burns.
+    #[account(seeds = [b"presale_authority"], bump)]
+    pub presale_authority: AccountInfo<'info>,
+    /// The buyer's token account that will receive $PANDA.
+    #[account(mut)]
+    pub buyer_token_account: Account<'info, TokenAccount>,
+    /// The mint for $PANDA.
+    pub token_mint: Account<'info, Mint>,
+    /// CHECK: Charity wallet account.
+    #[account(mut)]
+    pub charity_wallet: UncheckedAccount<'info>,
+    /// CHECK: Sale wallet account.
+    #[account(mut)]
+    pub sale_wallet: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+/// The presale configuration data.
+#[account]
+pub struct PresaleConfig {
+    pub charity_wallet: Pubkey,
+    pub sale_wallet: Pubkey,
+    pub current_tranche: u8,
+    pub total_funds_raised: u64,
+    pub total_tokens_sold: u64,
+    pub tranches: [Tranche; 10],
+}
+
+impl PresaleConfig {
+    // Roughly calculate the space needed for the PresaleConfig account.
+    pub const SIZE: usize = 32 + 32 + 1 + 8 + 8 + (10 * Tranche::SIZE);
+}
+
+/// Data for each tranche.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct Tranche {
+    pub token_allocation: u64, // total tokens allocated in this tranche
+    pub tokens_sold: u64,      // tokens sold so far in this tranche
+    pub price: u64,            // price per token (in lamports)
+}
+
+impl Tranche {
+    pub const SIZE: usize = 8 + 8 + 8; // 24 bytes per tranche
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Mathematical operation overflowed")]
+    MathOverflow,
+}
